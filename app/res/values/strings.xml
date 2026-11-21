@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="kb_desc">Keyboard driver experiment service: sets or pastes text into a focused field on broadcast command.</string>
+</resources>
