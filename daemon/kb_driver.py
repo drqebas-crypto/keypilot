@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """KB Driver daemon v2 (keyboard-driver project, 2026-11-05).
+v5.1.0-daemon (v2 build, 2026-11-12, spec
+kb-driver-fixes-spec-v2-2026-11-12.md; see "Stage 8" below).
 v5.0.2-daemon (2026-11-06 night, step 4 phase 1: service_up STATUS/SET_TOKEN, /shot STATUS and /status STATUS switched to the channel (fields) form - the last broadcast-only bootstrap reads; the one legitimate broadcast moment left is first-ever token present on a fresh install. Base v5.0.1 (2026-11-06 evening, KB-A/KB-K consult step 0: /epoch and /tap handlers fetch EPOCH_GET in the fields form - channel-first, same-seq broadcast fallback - instead of the legacy broadcast-only form that made every epoch read depend on rish; base v5.0 (2026-11-06, Aragon review + Claude FIX-1106): a persistent
 long-poll channel replaces the per-command `am` spawn (~1.6 s
 each) - the service polls /next, commands carry the same fields a
@@ -69,7 +71,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HOME = os.path.expanduser("~")
 PORT = 8773
 ALLOW = {"com.anthropic.claude", "com.termux", "com.moonshot.kimichat", "com.google.android.apps.bard",
- "com.google.android.googlequicksearchbox", "ai.qwenlm.chat.android", "com.openai.chatgpt"}
+ "com.google.android.googlequicksearchbox", "ai.qwenlm.chat.android", "com.openai.chatgpt",
+ "io.bigmoeonedge.example.dev", "com.google.android.packageinstaller"}
 # Phone atlas (2026-11-07, phase 1 integration): the daemon reads the
 # surface entry for a job package at exchange start and branches ONLY
 # on its typed fields (window_pkg, extraction_allowed, patience_s) -
@@ -629,6 +632,147 @@ def _recon_close(sha256, since_ts):
         return best
 
 
+# ---- Stage 8 (KB v2 build, 2026-11-12): spec
+# kb-driver-fixes-spec-v2-2026-11-12.md (ChatGPT KB-CHUNK-1112 verdict
+# adopted by the owner). Fixes:
+#  1. Explicit focused-field check before typing (strengthens the
+#     stage-6 respondent gate): wrong field or nothing focused stops
+#     the job before any keystroke.
+#  2. Chip + sender-side digest is diagnostic telemetry ONLY, never
+#     proof. VERIFIED needs receiver-side readable content; otherwise
+#     STAGED_UNVERIFIED / REJECTED / UNKNOWN, with the v2 retry rule.
+#  3. Per-app chunk ceilings (defaults below) + calibration logging.
+#     Shortcut/web-surface calibration is OUT OF SCOPE (owner dropped
+#     it as not worthy) - nothing here measures a shortcut surface.
+#  4. Standing error rule verified by inspection (see _exchange done()
+#     + _send_verdict readback_copy + DELIVER_HELD part_text): every
+#     error returns the exact chunk, the error and a message copy,
+#     never silent. Enforced, not rebuilt.
+
+# Fix 3: per-app chunk ceilings, used when neither the caller nor the
+# atlas surface carries one. Gemini (Bard app, window Google app)
+# 2100, Claude 2400, Kimi 2000; hard cap CHUNK_CAP (2554).
+CHUNK_DEFAULTS = {"com.google.android.apps.bard": 2100,
+                  "com.google.android.googlequicksearchbox": 2100,
+                  "com.anthropic.claude": 2400,
+                  "com.moonshot.kimichat": 2000}
+
+CALIB_LOG = os.path.join(HOME, "kb_calibration.jsonl")
+
+
+def _calib_log(entry):
+    """Fix 3: per-part calibration log (app, surface, chunk size,
+    result, failure shape). Best-effort; never fails a send."""
+    try:
+        line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S+03:00")}
+        line.update(entry)
+        with open(CALIB_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# Fix 2 retry rule: failure classification for a delivery part.
+# 'definite' = evidence the chunk was not accepted (the verb failed
+# before typing, the focus gate stopped it, or the read-back proved
+# the content wrong after the exchange cleared it): safe to retry
+# the same chunk ONCE. 'size-limit' = split only this chunk.
+# Anything else is 'ambiguous' (the chunk may already have landed):
+# stop and report UNKNOWN, never blind-retry.
+_DEFINITE_REASONS = frozenset({
+    "set-text-failed", "paste-mismatch", "paste-no-focus",
+    "paste-foreground-lost", "respondent-mismatch",
+    "no-focused-field", "focus-wrong-field",
+    "focus-status-unavailable", "cannot-foreground"})
+_SIZE_LIMIT_MARKERS = ("too-long", "size-limit", "too_long")
+
+
+def _classify_part_failure(resp):
+    reason = str(resp.get("reason") or "")
+    if any(m in reason for m in _SIZE_LIMIT_MARKERS):
+        return "size-limit"
+    if reason.startswith("verify-"):
+        if reason in ("verify-unknown", "verify-stale-chip"):
+            return "ambiguous"
+        return "definite"
+    if reason in _DEFINITE_REASONS:
+        return "definite"
+    return "ambiguous"
+
+
+def _chip_snapshot(win_pkg):
+    """Chip nodes in the live tree: (paths, payloads). A payload is
+    text/description carried by a chip node beyond the generic label
+    itself. Returns None when the digest is unavailable (UNKNOWN)."""
+    try:
+        dg = call("com.qebas.kbdriver.DIGEST", win_pkg,
+                  {"since": 0, "wait_ms": 0}, timeout=20.0)
+    except Exception:
+        return None
+    nodes = ((dg or {}).get("digest") or {}).get("nodes") or []
+    paths, payloads = set(), []
+    for n in nodes:
+        t = (n[2] if len(n) > 2 else "") or ""
+        d = (n[3] if len(n) > 3 else "") or ""
+        if "pasted" in (t + " " + d).lower():
+            paths.add(n[0] if len(n) > 0 else "")
+            for cand in (t, d):
+                c = (cand or "").strip()
+                if c and "pasted" not in c.lower():
+                    payloads.append((n[0] if len(n) > 0 else "", c))
+    return paths, payloads
+
+
+def _focus_check(win_pkg):
+    """Fix 1: explicit focused-field check before typing.
+    Returns (ok, detail). ok only when the service reports a focused
+    field AND the tree shows an EditText composer to type into.
+    detail names expected vs actual for the receipt. When the tree
+    is empty the field cannot be verified from it, so the check
+    falls back to the STATUS focused flag alone and says so
+    (code ok-status-only) instead of inventing a field. Termux has
+    no EditText composer, so STATUS focused alone is the check there."""
+    try:
+        st = call("com.qebas.kbdriver.STATUS", "status", {}, timeout=2.0)
+    except Exception:
+        st = None
+    if not st or not st.get("ok"):
+        return False, {"expected": "composer EditText",
+                       "actual": "unknown (STATUS unavailable)",
+                       "code": "focus-status-unavailable"}
+    if not st.get("focused"):
+        return False, {"expected": "composer EditText",
+                       "actual": "none focused",
+                       "code": "no-focused-field"}
+    if win_pkg == "com.termux":
+        return True, {"expected": "composer EditText",
+                      "actual": "focused (termux: no composer; "
+                      "STATUS focused only)",
+                      "code": "ok-status-only"}
+    try:
+        dg = call("com.qebas.kbdriver.DIGEST", win_pkg,
+                  {"since": 0, "wait_ms": 0}, timeout=20.0)
+    except Exception:
+        dg = None
+    nodes = ((dg or {}).get("digest") or {}).get("nodes") or []
+    if not nodes:
+        return True, {"expected": "composer EditText",
+                      "actual": "focused (digest empty; field not "
+                      "verified from tree)",
+                      "code": "ok-status-only"}
+    edits = [n for n in nodes
+             if "EditText" in str(n[1] if len(n) > 1 else "")]
+    if not edits:
+        return False, {"expected": "composer EditText",
+                       "actual": "focused, no EditText in tree",
+                       "code": "focus-wrong-field"}
+    last = edits[-1]
+    return True, {"expected": "composer EditText",
+                  "actual": "EditText path=%s" % (
+                      last[0] if len(last) > 0 else "?"),
+                  "code": "ok"}
+
+
 # ---- Stage 4 (KB rebuild 2026-11-08): verdict engine + split send --
 # The owner's send-with-error rule (2026-11-08): for owner/consult
 # traffic a message that was set with a small, measurable error is
@@ -777,19 +921,37 @@ def _digest_composer(win_pkg):
     return comp, chip
 
 
-def _send_verdict(win_pkg, text, getres, spec):
+def _send_verdict(win_pkg, text, getres, spec, pre_chip_paths=None):
     """Decide whether a daemon-side set may be armed, and how the
-    send will be reported. getres is the GET_TEXT result."""
+    send will be reported. getres is the GET_TEXT result.
+    v2 (KB-CHUNK-1112): chip presence + sender-side digest is
+    diagnostic telemetry ONLY, never proof. chunk_state is one of
+    VERIFIED / STAGED_UNVERIFIED / REJECTED / UNKNOWN:
+    - VERIFIED: receiver-side readable content read back and matched
+      within the standing tolerance (CER bands; exact digest match
+      is the clean case). The band still records fidelity.
+    - STAGED_UNVERIFIED: a fresh chip node and an empty editor, no
+      readable payload. Staged, not proven.
+    - REJECTED: definite evidence the chunk was not accepted as
+      intended (class-C fail, CER > 1%).
+    - UNKNOWN: ambiguous - digest unavailable, or the only chip is
+      stale (predates this chunk)."""
     want = hashlib.sha256(text.encode("utf-8")).hexdigest()
     got = (getres or {}).get("sha256")
     if got == want:
-        return {"band": "clean", "cer": 0.0, "class_c_fail": False}
+        return {"band": "clean", "chunk_state": "VERIFIED", "cer": 0.0,
+                "class_c_fail": False}
     policy = spec.get("policy") or "send_with_report"
     base = {"readback_sha": got,
             "readback_chars": (getres or {}).get("chars")}
-    comp, chip = _digest_composer(win_pkg)
-    if chip and not comp:
-        v = {"band": "chip", "cer": None, "class_c_fail": False}
+    try:
+        comp, chip = _digest_composer(win_pkg)
+    except Exception:
+        # Digest unreadable: the chunk may or may not have landed.
+        # v2 reports UNKNOWN rather than crashing the exchange.
+        v = {"band": "hold", "code": "digest-unavailable",
+             "chunk_state": "UNKNOWN", "cer": None,
+             "class_c_fail": False}
         v.update(base)
         return v
     if comp:
@@ -798,26 +960,85 @@ def _send_verdict(win_pkg, text, getres, spec):
         v.update(base)
         if v["class_c_fail"]:
             v["band"] = "hold"
+            v["chunk_state"] = "REJECTED"
         elif v["cer"] == 0:
             v["band"] = "clean"
+            v["chunk_state"] = "VERIFIED"
         elif v["cer"] <= 0.001:
             v["band"] = "clean-noted"
+            v["chunk_state"] = "VERIFIED"
         elif v["cer"] <= 0.01:
             v["band"] = "sent-with-error"
+            v["chunk_state"] = "VERIFIED"
         else:
             v["band"] = "hold"
+            v["chunk_state"] = "REJECTED"
         if v["band"] == "sent-with-error":
             v["readback_copy"] = comp[:20000]
-        if policy == "strict" and v["band"] not in ("clean", "chip"):
+        if policy == "strict" and v["band"] != "clean":
             v["band"] = "hold"
+            v["chunk_state"] = "REJECTED"
+            v["code"] = "strict"
+        return v
+    if chip:
+        # A chip with no composer text: try the chip's own payload
+        # before declaring the chunk unverified.
+        snap = _chip_snapshot(win_pkg)
+        if snap is None:
+            v = {"band": "hold", "code": "unknown",
+                 "chunk_state": "UNKNOWN", "cer": None,
+                 "class_c_fail": False}
+            v.update(base)
+            return v
+        paths, payloads = snap
+        fresh = bool(pre_chip_paths is not None and
+                     (paths - pre_chip_paths))
+        for _path, payload in payloads:
+            if pre_chip_paths is not None and \
+                    _path in pre_chip_paths:
+                continue  # stale node: never proof for this chunk
+            pv = _verdict_engine(text, payload,
+                                 spec.get("critical") or [])
+            if not pv["class_c_fail"] and pv["cer"] <= 0.01:
+                v = dict(pv)
+                v["recovered_via"] = "chip-payload"
+                v["chunk_state"] = "VERIFIED"
+                v["band"] = ("clean" if pv["cer"] == 0 else
+                             "clean-noted" if pv["cer"] <= 0.001 else
+                             "sent-with-error")
+                v["chip_fresh"] = fresh or pre_chip_paths is None
+                if v["band"] == "sent-with-error":
+                    v["readback_copy"] = payload[:20000]
+                v.update(base)
+                if policy == "strict" and v["band"] != "clean":
+                    v["band"] = "hold"
+                    v["chunk_state"] = "REJECTED"
+                    v["code"] = "strict"
+                return v
+        if pre_chip_paths is not None and not fresh and paths:
+            # The only chip predates this chunk: it may belong to an
+            # earlier chunk. Ambiguous - stop, do not arm on it.
+            v = {"band": "hold", "code": "stale-chip",
+                 "chunk_state": "UNKNOWN", "cer": None,
+                 "class_c_fail": False}
+            v.update(base)
+            return v
+        v = {"band": "staged-unverified", "cer": None,
+             "class_c_fail": False, "chunk_state": "STAGED_UNVERIFIED",
+             "chip_fresh": fresh}
+        v.update(base)
         return v
     if policy == "strict":
         v = {"band": "hold", "cer": None, "class_c_fail": False,
-             "code": "verify-mismatch"}
+             "code": "mismatch", "chunk_state": "REJECTED"}
         v.update(base)
         return v
+    # No readable content and no chip: the service accepted the set
+    # (SET_TEXT returned ok) but nothing is observable. Labelled
+    # honestly as staged-unverified; the old band name is kept so
+    # callers that key on it keep working.
     v = {"band": "sent-with-error-unmeasured", "cer": None,
-         "class_c_fail": False}
+         "class_c_fail": False, "chunk_state": "STAGED_UNVERIFIED"}
     v.update(base)
     return v
 
@@ -859,6 +1080,12 @@ def _paste_commit(win_pkg, launch_pkg, epoch, text, rec, saved_box):
             st = call("com.qebas.kbdriver.STATUS", "status", {})
         if not st or not st.get("focused"):
             return "paste-no-focus"
+    # v2 Fix 1: re-check the focused field after the window
+    # switches above; a re-focus can land on the wrong control.
+    fok, fdetail = _focus_check(win_pkg)
+    rec["focus_check"] = fdetail
+    if not fok:
+        return "paste-no-focus"
     lt = int(st.get("last_touch_ms") or 0)
     if lt and (int(time.time() * 1000) - lt) < 3000:
         return "owner-touch"
@@ -906,8 +1133,9 @@ _xchg = {}
 # one, else 2400; hard cap 2554), paragraph boundaries first, adapt
 # DOWN only (-30% when a part runs >2x the running median or its
 # anchor is unbound; adaptation journalled), floor 500 chars (two
-# floor failures -> HOLD floor-reached), no same-part retry, per-part
-# verdicts from the stage-4 engine, parts carry the job tag and a
+# floor failures -> HOLD floor-reached), one same-part retry on
+# definite rejection only (v2), per-part verdicts from the
+# stage-4 engine, parts carry the job tag and a
 # final-part flag (no upfront N: adaptive re-chunking would make it
 # a lie; the payload's own END sentinel is the completeness
 # contract). A daemon death mid-job marks the job INTERRUPTED at
@@ -1024,20 +1252,102 @@ def _delivery_run(job):
             t0 = time.time()
             resp = exchange(spec)
             wall = time.time() - t0
-            band = (resp.get("verdict") or {}).get("band")
+            verdict = resp.get("verdict") or {}
+            band = verdict.get("band")
+            chunk_state = verdict.get("chunk_state")
+            job.setdefault("chunk_states", []).append(chunk_state)
+            if chunk_state == "STAGED_UNVERIFIED":
+                job["unverified_parts"] = \
+                    job.get("unverified_parts", 0) + 1
+            _calib_log({"job": job["job"], "app": job["pkg"],
+                        "surface": (ctx.get("win_pkg") or job["pkg"]),
+                        "chunk_size": job["ceiling"],
+                        "result": chunk_state or band,
+                        "failure_shape": resp.get("reason") or ""})
             receipt({"kind": "DELIVER_PART", "job": job["job"], "k": k,
                      "status": resp.get("status"), "band": band,
+                     "chunk_state": chunk_state,
                      "reason": resp.get("reason"),
                      "sha256": hashlib.sha256(
                          part_text.encode("utf-8")).hexdigest(),
                      "ms": int(wall * 1000),
                      "ceiling": job["ceiling"]})
             if resp.get("status") != "sent":
+                # v2 Fix 2 retry rule: classify the failure first.
+                job.setdefault("retries", {})
+                kind = _classify_part_failure(resp)
+                if kind == "size-limit":
+                    # Split ONLY this failed chunk into smaller
+                    # numbered pieces and verify each independently.
+                    new_ceiling = job["ceiling"] // 2
+                    if new_ceiling < CHUNK_FLOOR:
+                        job["state"] = "held"
+                        job["hold_reason"] = "floor-reached"
+                    else:
+                        pieces = _chunk_text(part_text, new_ceiling)
+                        if len(pieces) <= 1:
+                            job["state"] = "held"
+                            job["hold_reason"] = (
+                                "size-limit-unsplittable")
+                        else:
+                            job["remaining"] = (
+                                pieces + job["remaining"][1:])
+                            job["parts_total"] = (
+                                job["parts_sent"] +
+                                len(job["remaining"]))
+                            receipt({"kind": "DELIVER_SPLIT",
+                                     "job": job["job"], "k": k,
+                                     "from": job["ceiling"],
+                                     "to": new_ceiling,
+                                     "pieces": len(pieces)})
+                            job["ceiling"] = new_ceiling
+                    if job["state"] == "held":
+                        job["updated"] = time.strftime(
+                            "%Y-%m-%dT%H:%M:%S+03:00")
+                        _delivery_save(job)
+                        receipt({"kind": "DELIVER_HELD",
+                                 "job": job["job"],
+                                 "reason": job["hold_reason"],
+                                 "chunk_state": chunk_state,
+                                 "part_index": k,
+                                 "part_sha256": hashlib.sha256(
+                                     part_text.encode(
+                                         "utf-8")).hexdigest(),
+                                 "part_text": part_text})
+                        return
+                    _delivery_save(job)
+                    time.sleep(2)
+                    continue
+                if kind == "definite" and \
+                        job["retries"].get(k, 0) < 1:
+                    # Definite rejection, evidence the chunk was not
+                    # accepted: retry this same chunk ONCE.
+                    job["retries"][k] = job["retries"].get(k, 0) + 1
+                    receipt({"kind": "DELIVER_RETRY",
+                             "job": job["job"], "k": k,
+                             "reason": resp.get("reason"),
+                             "sha256": hashlib.sha256(
+                                 part_text.encode("utf-8")).hexdigest(),
+                             "attempt": job["retries"][k]})
+                    _delivery_save(job)
+                    time.sleep(2)
+                    continue
+                # Ambiguous, or the one retry already failed: stop
+                # and report UNKNOWN with the exact chunk, the error
+                # and the message copy. Never blind-retry.
                 job["state"] = "held"
                 job["hold_reason"] = "%s:%s" % (
                     resp.get("status"), resp.get("reason"))
-                job["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S+03:00")
+                job["updated"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%S+03:00")
                 _delivery_save(job)
+                receipt({"kind": "DELIVER_HELD", "job": job["job"],
+                         "reason": job["hold_reason"],
+                         "chunk_state": chunk_state,
+                         "part_index": k,
+                         "part_sha256": hashlib.sha256(
+                             part_text.encode("utf-8")).hexdigest(),
+                         "part_text": part_text})
                 return
             claim = resp.get("respondent_claimed")
             if claim and not job.get("respondent_claimed"):
@@ -1090,6 +1400,8 @@ def _delivery_run(job):
         _delivery_save(job)
         receipt({"kind": "DELIVER_DONE", "job": job["job"],
                  "parts": job["parts_sent"], "bands": job["bands"],
+                 "chunk_states": job.get("chunk_states"),
+                 "unverified_parts": job.get("unverified_parts", 0),
                  "wait_status": (job.get("wait") or {}).get("status")})
     except Exception as e:
         job["state"] = "held"
@@ -1334,6 +1646,16 @@ def _exchange(spec):
             return done("aborted", reason="respondent-mismatch",
                         respondent_claimed=claim)
         phases = {}
+        # v2 Fix 1: explicit focused-field check before anything
+        # is typed. The cold-start tap above may have re-focused
+        # the composer; this verifies the result instead of
+        # assuming it. Skipped for wait-only passes (no typing).
+        if not spec.get("wait_only"):
+            fok, fdetail = _focus_check(win_pkg)
+            rec["focus_check"] = fdetail
+            if not fok:
+                return done("aborted", reason=fdetail["code"],
+                            phases=phases, focus=fdetail)
         if spec.get("wait_only"):
             # Stage 4 split: the send already happened in /send; this
             # pass runs only the extraction below.
@@ -1345,6 +1667,11 @@ def _exchange(spec):
             # decided; the reply is harvested by a separate /wait.
             # Stage 7: with "paste": true the text enters via the
             # clipboard instead (flagged surfaces only).
+            # v2 Fix 2: snapshot the chip nodes BEFORE the text
+            # enters the composer, so the verdict can tell a fresh
+            # chip for this chunk from a stale one.
+            _pre_chip = _chip_snapshot(win_pkg)
+            pre_chip_paths = _pre_chip[0] if _pre_chip else None
             t_ph = time.time()
             if spec.get("paste"):
                 if not (entry or {}).get("paste_allowed"):
@@ -1362,7 +1689,8 @@ def _exchange(spec):
                     return done("aborted", reason="set-text-failed",
                                 phases=phases)
             g = call("com.qebas.kbdriver.GET_TEXT", win_pkg, {})
-            verdict = _send_verdict(win_pkg, text, g, spec)
+            verdict = _send_verdict(win_pkg, text, g, spec,
+                            pre_chip_paths=pre_chip_paths)
             verdict["via"] = "paste" if spec.get("paste") else "set"
             if spec.get("paste") and \
                     verdict.get("band") == "sent-with-error-unmeasured" \
@@ -1772,12 +2100,18 @@ class H(BaseHTTPRequestHandler):
                 text = data.get("text", "")
                 pkg = data.get("pkg", "")
                 entry, _ah = _atlas_entry(pkg)
+                # v2 Fix 3: caller > atlas chunk_chars > per-app
+                # default > 2400; hard cap CHUNK_CAP (2554).
+                # Shortcut/web-surface calibration is out of scope.
                 ceiling = int(data.get("ceiling") or
-                              (entry or {}).get("chunk_chars") or 2400)
+                              (entry or {}).get("chunk_chars") or
+                              CHUNK_DEFAULTS.get(pkg) or 2400)
                 ceiling = max(CHUNK_FLOOR, min(CHUNK_CAP, ceiling))
                 ceiling_source = ("caller" if data.get("ceiling")
                                   else "atlas"
                                   if (entry or {}).get("chunk_chars")
+                                  else "app-default"
+                                  if pkg in CHUNK_DEFAULTS
                                   else "default")
                 job = {"job": "dlv-%d" % int(time.time() * 1000),
                        "pkg": pkg, "state": "running",
@@ -1789,6 +2123,8 @@ class H(BaseHTTPRequestHandler):
                        "parts_sent": 0,
                        "remaining": _chunk_text(text, ceiling),
                        "bands": [], "walls": [], "floor_hits": 0,
+                       "retries": {}, "chunk_states": [],
+                       "unverified_parts": 0,
                        "critical": data.get("critical") or [],
                        "paste": bool(data.get("paste")),
                        "policy": data.get("policy"),
@@ -1827,6 +2163,9 @@ class H(BaseHTTPRequestHandler):
                            "parts_total": job.get("parts_total"),
                            "parts_remaining": len(job["remaining"]),
                            "bands": job["bands"],
+                           "chunk_states": job.get("chunk_states"),
+                           "unverified_parts": job.get(
+                               "unverified_parts", 0),
                            "ceiling": job["ceiling"],
                            "hold_reason": job.get("hold_reason"),
                            "wait": job.get("wait")}
@@ -2077,6 +2416,7 @@ class H(BaseHTTPRequestHandler):
         # never be wedged by exchange work (stage-3 named cause).
         wedge = _status_cache["wedge"]
         out = {"service": "kb_driver", "port": PORT, "version": 5.0,
+               "build": "v2-2026-11-12",
                "allow": sorted(ALLOW), "wedge": wedge,
                "epoch_live": _status_cache["epoch"],
                "status_cache_age_s": round(
